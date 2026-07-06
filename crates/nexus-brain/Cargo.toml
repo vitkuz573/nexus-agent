@@ -1,0 +1,17 @@
+[package]
+name = "nexus-brain"
+description = "Advanced AI capabilities — semantic analysis, hypothesis engine, code archaeology"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nexus-config = { path = "../nexus-config" }
+nexus-client = { path = "../nexus-client" }
+nexus-tools = { path = "../nexus-tools" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

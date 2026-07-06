@@ -1,0 +1,16 @@
+[package]
+name = "nexus-cognitive"
+description = "Cognitive tools — think, verify, analyze, search, remember"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nexus-brain = { path = "../nexus-brain" }
+nexus-tools = { path = "../nexus-tools" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+lazy_static = "1"

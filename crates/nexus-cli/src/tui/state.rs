@@ -10,7 +10,43 @@ use std::time::Instant;
 use nexus_brain::thought::ThoughtChain;
 use nexus_brain::verify::VerificationResult;
 
-/// One entry in the conversation transcript.
+/// A single visible block in the conversation panel.
+///
+/// Each block is rendered as an independent unit (its own header line,
+/// its own content lines). Blocks never share a selection. They scroll
+/// together as one continuous transcript.
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub kind: BlockKind,
+    pub content: String,
+    pub created_at: Instant,
+    pub elapsed_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BlockKind {
+    User,
+    Assistant,
+    StreamingAssistant,
+    Thinking,
+    ToolCall {
+        name: String,
+        args: String,
+        status: ToolCallStatus,
+    },
+    System,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallStatus {
+    Running,
+    Ok,
+    Failed,
+}
+
+/// Legacy message type — kept for the slash-command code paths that still
+/// construct it. New code should push `Block`s instead.
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: MessageRole,
@@ -28,7 +64,7 @@ pub enum MessageRole {
     Error,
 }
 
-/// One tool call as it is being executed.
+/// Legacy tool event — kept for compatibility with the old event bus.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ToolEvent {
@@ -52,7 +88,7 @@ pub enum ToolStatus {
 pub enum Focus {
     Input,
     Conversation,
-    Sidebar,
+    Files,
 }
 
 /// Top-level status shown in the header.
@@ -64,7 +100,6 @@ pub enum AgentStatus {
     Running,
 }
 
-/// Lightweight summary of a verification result, rendered in the sidebar.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct VerificationDisplay {
@@ -76,8 +111,9 @@ pub struct VerificationDisplay {
 /// Aggregated state passed into the renderer each frame.
 #[allow(dead_code)]
 pub struct TuiState {
-    pub messages: Vec<Message>,
-    pub tool_events: Vec<ToolEvent>,
+    /// All blocks in display order — user msgs, assistant msgs, tool
+    /// calls, thinking, errors — all interleaved.
+    pub blocks: Vec<Block>,
     pub thought_chain: Option<ThoughtChain>,
     pub verifications: Vec<VerificationResult>,
     pub status: AgentStatus,
@@ -95,6 +131,8 @@ pub struct TuiState {
     pub command_palette: bool,
     pub help_visible: bool,
     pub spinner_frame: usize,
+    /// Timestamp of the last started agent run (for per-message timing).
+    pub run_started_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,16 +145,18 @@ pub struct FileEntry {
 
 #[derive(Debug, Default, Clone)]
 pub struct ScrollState {
-    pub conversation_offset: usize,
-    pub sidebar_offset: usize,
+    /// When true, follow new content (snap to bottom on new blocks).
+    pub auto_follow: bool,
+    /// Manual offset from bottom. Only meaningful when `auto_follow` is false.
+    pub manual_offset: usize,
+    /// Reserved for future per-region scroll.
     pub input_offset: usize,
 }
 
 impl TuiState {
     pub fn new(model: String, provider: String, max_rounds: usize, max_tokens: u32) -> Self {
         Self {
-            messages: Vec::new(),
-            tool_events: Vec::new(),
+            blocks: Vec::new(),
             thought_chain: None,
             verifications: Vec::new(),
             status: AgentStatus::Idle,
@@ -130,10 +170,15 @@ impl TuiState {
             started_at: Instant::now(),
             elapsed_ms: 0,
             file_tree: Vec::new(),
-            scroll: ScrollState::default(),
+            scroll: ScrollState {
+                auto_follow: true,
+                manual_offset: 0,
+                input_offset: 0,
+            },
             command_palette: false,
             help_visible: false,
             spinner_frame: 0,
+            run_started_at: None,
         }
     }
 
@@ -142,15 +187,18 @@ impl TuiState {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }
 
-    pub fn push_message(&mut self, msg: Message) {
-        self.messages.push(msg);
+    pub fn push_block(&mut self, block: Block) {
+        self.blocks.push(block);
     }
 
-    pub fn push_tool(&mut self, tool: ToolEvent) {
-        self.tool_events.push(tool);
+    pub fn last_block_mut(&mut self) -> Option<&mut Block> {
+        self.blocks.last_mut()
     }
 
-    pub fn last_message_mut(&mut self) -> Option<&mut Message> {
-        self.messages.last_mut()
+    pub fn last_streaming_mut(&mut self) -> Option<&mut Block> {
+        self.blocks
+            .iter_mut()
+            .rev()
+            .find(|b| matches!(b.kind, BlockKind::StreamingAssistant))
     }
 }

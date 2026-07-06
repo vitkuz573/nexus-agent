@@ -47,6 +47,16 @@ pub struct Theme {
     pub border: Color,
     pub selection: Color,
     pub highlight: Color,
+    /// Subtle background tint for user message blocks.
+    pub block_bg_user: Color,
+    /// Subtle background tint for assistant message blocks.
+    pub block_bg_assistant: Color,
+    /// Subtle background tint for tool-call blocks.
+    pub block_bg_tool: Color,
+    /// Subtle background tint for thinking blocks.
+    pub block_bg_thinking: Color,
+    /// Subtle background tint for system blocks.
+    pub block_bg_system: Color,
 }
 
 impl Theme {
@@ -65,6 +75,11 @@ impl Theme {
             border: Color::DarkGray,
             selection: Color::DarkGray,
             highlight: Color::LightCyan,
+            block_bg_user: Color::Rgb(30, 40, 60),
+            block_bg_assistant: Color::Rgb(35, 30, 45),
+            block_bg_tool: Color::Rgb(40, 35, 25),
+            block_bg_thinking: Color::Rgb(30, 35, 35),
+            block_bg_system: Color::Rgb(25, 25, 25),
         }
     }
 
@@ -83,6 +98,11 @@ impl Theme {
             border: Color::Gray,
             selection: Color::LightBlue,
             highlight: Color::Cyan,
+            block_bg_user: Color::Rgb(230, 240, 255),
+            block_bg_assistant: Color::Rgb(245, 235, 250),
+            block_bg_tool: Color::Rgb(255, 245, 220),
+            block_bg_thinking: Color::Rgb(235, 240, 240),
+            block_bg_system: Color::Rgb(240, 240, 240),
         }
     }
 
@@ -101,6 +121,11 @@ impl Theme {
             border: Color::Rgb(88, 110, 117),
             selection: Color::Rgb(7, 54, 66),
             highlight: Color::Rgb(42, 161, 152),
+            block_bg_user: Color::Rgb(0, 35, 45),
+            block_bg_assistant: Color::Rgb(30, 25, 40),
+            block_bg_tool: Color::Rgb(45, 30, 20),
+            block_bg_thinking: Color::Rgb(20, 35, 35),
+            block_bg_system: Color::Rgb(15, 25, 30),
         }
     }
 

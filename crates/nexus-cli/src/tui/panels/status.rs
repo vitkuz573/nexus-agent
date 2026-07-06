@@ -13,12 +13,12 @@ pub fn render_status(f: &mut Frame, area: Rect, state: &TuiState, theme: &Theme)
     let mode_label = match state.focus {
         Focus::Input => "INPUT",
         Focus::Conversation => "CONVERSATION",
-        Focus::Sidebar => "SIDEBAR",
+        Focus::Files => "FILES",
     };
     let mode_color = match state.focus {
         Focus::Input => theme.accent,
         Focus::Conversation => theme.assistant,
-        Focus::Sidebar => theme.tool,
+        Focus::Files => theme.tool,
     };
 
     let agent_label = match state.status {

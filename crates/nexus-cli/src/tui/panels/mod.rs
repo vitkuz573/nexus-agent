@@ -2,39 +2,40 @@
 //! the shared state, then renders into that area.
 
 pub mod conversation;
+pub mod files;
 pub mod header;
 pub mod input;
-pub mod sidebar;
 pub mod status;
 
 pub use conversation::render_conversation;
+pub use files::render_files;
 pub use header::render_header;
 pub use input::render_input;
-pub use sidebar::render_sidebar;
 pub use status::render_status;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Compute the standard 5-region layout.
+/// Compute the standard 4-region layout.
 ///
 /// ```
 /// ┌───────────────────────────────────────────────────────────────┐
-/// │                          Header (3)                          │
-/// ├──────────┬───────────────────────────────┬───────────────────┤
-/// │ Sidebar  │       Conversation            │  Cognitive        │
-/// │ (left)   │       (center)                │  (right)          │
-/// │          │                               │                   │
-/// ├──────────┴───────────────────────────────┴───────────────────┤
-/// │                          Input (5)                           │
+/// │                          Header (1)                          │
+/// ├──────────┬────────────────────────────────────────────────────┤
+/// │          │                                                     │
+/// │  Files   │              Conversation                           │
+/// │  (20%)   │              (75%, block-based)                     │
+/// │          │                                                     │
+/// ├──────────┴────────────────────────────────────────────────────┤
+/// │                          Input (5)                            │
 /// ├───────────────────────────────────────────────────────────────┤
-/// │                          Status (1)                          │
+/// │                          Status (1)                           │
 /// └───────────────────────────────────────────────────────────────┘
 /// ```
-pub fn layout(area: Rect, sidebar_left: bool) -> Vec<Rect> {
+pub fn layout(area: Rect) -> Vec<Rect> {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Length(5),
             Constraint::Length(1),
@@ -43,20 +44,8 @@ pub fn layout(area: Rect, sidebar_left: bool) -> Vec<Rect> {
 
     let middle = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(if sidebar_left {
-            [
-                Constraint::Percentage(20),
-                Constraint::Percentage(55),
-                Constraint::Percentage(25),
-            ]
-        } else {
-            [
-                Constraint::Percentage(25),
-                Constraint::Percentage(55),
-                Constraint::Percentage(20),
-            ]
-        })
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
         .split(vertical[1]);
 
-    vec![vertical[0], middle[0], middle[1], middle[2], vertical[2], vertical[3]]
+    vec![vertical[0], middle[0], middle[1], vertical[2], vertical[3]]
 }

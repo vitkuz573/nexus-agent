@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
@@ -17,11 +17,11 @@ use tokio::sync::mpsc;
 
 use crate::tui::command::{SlashCommand, COMMAND_HELP};
 use crate::tui::input::InputBuffer;
-use crate::tui::panels::{render_conversation, render_header, render_input, render_sidebar, render_status};
+use crate::tui::panels::{layout, render_conversation, render_files, render_header, render_input, render_status};
 use crate::tui::state::{
-    AgentStatus, FileEntry, Focus, Message, MessageRole, TuiState,
+    Block as ConvBlock, BlockKind, FileEntry, Focus, ToolCallStatus, TuiState,
 };
-use crate::tui::stream::{UiEvent, UiSink};
+use crate::tui::stream::UiEvent;
 use crate::tui::theme::{Theme, ThemeName};
 
 pub struct App {
@@ -37,8 +37,9 @@ pub struct App {
     theme: Theme,
     theme_name: ThemeName,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
-    ui_tx: UiSink,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
     help_open: bool,
+    should_quit: bool,
     conversation: Vec<LlmMessage>,
 }
 
@@ -75,6 +76,7 @@ impl App {
             ui_rx,
             ui_tx,
             help_open: false,
+            should_quit: false,
             conversation: Vec::new(),
         }
     }
@@ -83,6 +85,7 @@ impl App {
         let tick = Duration::from_millis(50);
         loop {
             self.state.tick();
+            self.update_running_blocks();
 
             while let Ok(ev) = self.ui_rx.try_recv() {
                 self.apply_ui_event(ev);
@@ -94,33 +97,44 @@ impl App {
                 self.handle_event(event::read()?)?;
             }
 
-            if self.state.status == AgentStatus::Idle && self.input.is_empty() && self.should_quit() {
+            if self.should_quit {
                 break;
             }
         }
         Ok(())
     }
 
-    fn should_quit(&self) -> bool {
-        false
+    fn update_running_blocks(&mut self) {
+        // Update elapsed_ms for streaming/thinking blocks
+        if let Some(started) = self.state.run_started_at {
+            let elapsed = started.elapsed().as_millis();
+            for blk in self.state.blocks.iter_mut() {
+                match blk.kind {
+                    BlockKind::StreamingAssistant | BlockKind::Thinking => {
+                        blk.elapsed_ms = Some(elapsed);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn render(&self, f: &mut Frame) {
         let area = f.area();
-        let regions = crate::tui::panels::layout(area, true);
+        let regions = layout(area);
 
         render_header(f, regions[0], &self.state, &self.theme);
-        render_sidebar(f, regions[1], &self.state, &self.theme, self.state.focus == Focus::Sidebar);
+        render_files(f, regions[1], &self.state, &self.theme, self.state.focus == Focus::Files);
         render_conversation(f, regions[2], &self.state, &self.theme, self.state.focus == Focus::Conversation);
         render_input(
             f,
-            regions[4],
+            regions[3],
             &self.input,
             &self.state,
             &self.theme,
             self.state.focus == Focus::Input,
         );
-        render_status(f, regions[5], &self.state, &self.theme);
+        render_status(f, regions[4], &self.state, &self.theme);
 
         if self.help_open {
             render_help(f, area, &self.theme);
@@ -139,13 +153,26 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            std::process::exit(0);
+            self.should_quit = true;
+            return;
+        }
+
+        // Esc closes help if open, else clears input
+        if key.code == KeyCode::Esc {
+            if self.help_open {
+                self.help_open = false;
+                return;
+            }
+            if self.state.focus == Focus::Input && !self.input.is_empty() {
+                self.input.clear();
+                return;
+            }
         }
 
         match self.state.focus {
             Focus::Input => self.handle_input_key(key),
             Focus::Conversation => self.handle_conversation_key(key),
-            Focus::Sidebar => self.handle_sidebar_key(key),
+            Focus::Files => self.handle_files_key(key),
         }
     }
 
@@ -157,8 +184,10 @@ impl App {
                 } else {
                     let text = self.input.submit();
                     if !text.trim().is_empty() {
-                        if let Some(cmd) = text.parse::<SlashCommand>().ok().filter(|_| text.trim().starts_with('/')) {
-                            self.handle_slash(cmd);
+                        if text.trim().starts_with('/') {
+                            if let Ok(cmd) = text.parse::<SlashCommand>() {
+                                self.handle_slash(cmd);
+                            }
                         } else {
                             self.send_message(text);
                         }
@@ -180,8 +209,8 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.input.move_home(),
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => self.input.move_end(),
             (KeyModifiers::NONE, KeyCode::Tab) => self.state.focus = Focus::Conversation,
-            (KeyModifiers::SHIFT, KeyCode::BackTab) => self.state.focus = Focus::Sidebar,
-            (KeyModifiers::SHIFT, KeyCode::Tab) => self.state.focus = Focus::Sidebar,
+            (KeyModifiers::SHIFT, KeyCode::BackTab) => self.state.focus = Focus::Files,
+            (KeyModifiers::SHIFT, KeyCode::Tab) => self.state.focus = Focus::Files,
             (KeyModifiers::NONE, KeyCode::F(1)) => self.help_open = !self.help_open,
             (_, KeyCode::Char(c)) => self.input.insert_char(c),
             _ => {}
@@ -190,91 +219,68 @@ impl App {
 
     fn handle_conversation_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Tab => self.state.focus = Focus::Sidebar,
-            KeyCode::BackTab => self.state.focus = Focus::Input,
-            KeyCode::PageUp => {
-                self.state.scroll.conversation_offset =
-                    self.state.scroll.conversation_offset.saturating_sub(5);
-            }
-            KeyCode::PageDown => {
-                self.state.scroll.conversation_offset = self.state.scroll.conversation_offset.saturating_add(5);
-            }
-            KeyCode::Up => {
-                self.state.scroll.conversation_offset =
-                    self.state.scroll.conversation_offset.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                self.state.scroll.conversation_offset =
-                    self.state.scroll.conversation_offset.saturating_add(1);
+            KeyCode::Tab => self.state.focus = Focus::Input,
+            KeyCode::BackTab => self.state.focus = Focus::Files,
+            KeyCode::PageUp => self.scroll_up(5),
+            KeyCode::PageDown => self.scroll_down(5),
+            KeyCode::Up => self.scroll_up(1),
+            KeyCode::Down => self.scroll_down(1),
+            KeyCode::Home => self.state.scroll.manual_offset = 0,
+            KeyCode::End => {
+                self.state.scroll.auto_follow = true;
+                self.state.scroll.manual_offset = 0;
             }
             KeyCode::F(1) => self.help_open = !self.help_open,
             _ => {}
         }
     }
 
-    fn handle_sidebar_key(&mut self, key: KeyEvent) {
+    fn handle_files_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Tab => self.state.focus = Focus::Input,
-            KeyCode::BackTab => self.state.focus = Focus::Conversation,
-            KeyCode::PageUp => {
-                self.state.scroll.sidebar_offset = self.state.scroll.sidebar_offset.saturating_sub(5);
-            }
-            KeyCode::PageDown => {
-                self.state.scroll.sidebar_offset = self.state.scroll.sidebar_offset.saturating_add(5);
-            }
+            KeyCode::Tab => self.state.focus = Focus::Conversation,
+            KeyCode::BackTab => self.state.focus = Focus::Input,
             KeyCode::F(1) => self.help_open = !self.help_open,
             _ => {}
+        }
+    }
+
+    fn scroll_up(&mut self, n: usize) {
+        self.state.scroll.auto_follow = false;
+        self.state.scroll.manual_offset = self.state.scroll.manual_offset.saturating_add(n);
+    }
+
+    fn scroll_down(&mut self, n: usize) {
+        if self.state.scroll.manual_offset > n {
+            self.state.scroll.manual_offset -= n;
+        } else {
+            self.state.scroll.manual_offset = 0;
+            self.state.scroll.auto_follow = true;
         }
     }
 
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.state.scroll.conversation_offset =
-                    self.state.scroll.conversation_offset.saturating_sub(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.state.scroll.conversation_offset =
-                    self.state.scroll.conversation_offset.saturating_add(3);
-            }
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            MouseEventKind::ScrollDown => self.scroll_down(3),
             _ => {}
         }
     }
 
     fn handle_slash(&mut self, cmd: SlashCommand) {
         match cmd {
-            SlashCommand::Help => {
-                self.help_open = true;
-            }
+            SlashCommand::Help => self.help_open = true,
             SlashCommand::Unknown(s) => {
                 self.help_open = true;
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!("Unknown command: {s} (press F1 for help)"),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system(format!("Unknown command: {s} (press F1 for help)"));
             }
             SlashCommand::Clear => {
-                self.state.messages.clear();
-                self.state.tool_events.clear();
-                self.ui_tx
-                    .send(UiEvent::AppendMessage {
-                        role: MessageRole::System,
-                        content: "Conversation cleared.".to_string(),
-                    })
-                    .ok();
+                self.state.blocks.clear();
+                self.push_system("Conversation cleared.".to_string());
             }
             SlashCommand::Theme => {
                 self.theme_name = self.theme_name.next();
                 self.theme = Theme::by_name(self.theme_name);
-                let msg = format!("Theme → {}", self.theme_name.as_str());
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: msg,
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system(format!("Theme → {}", self.theme_name.as_str()));
             }
             SlashCommand::Tools => {
                 let tools = self.registry.definitions();
@@ -283,23 +289,13 @@ impl App {
                     .map(|d| format!("  • {} — {}", d.name, d.description))
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!("Tools:\n{body}"),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system(format!("Tools:\n{body}"));
             }
             SlashCommand::Model => {
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!(
-                        "Model: {} @ {}",
-                        self.state.model, self.state.provider
-                    ),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system(format!(
+                    "Model: {} @ {}",
+                    self.state.model, self.state.provider
+                ));
             }
             SlashCommand::Providers => {
                 let body = match nexus_config::settings::Settings::load() {
@@ -311,90 +307,126 @@ impl App {
                         .join("\n"),
                     Err(e) => format!("(error: {e})"),
                 };
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!("Providers:\n{body}"),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system(format!("Providers:\n{body}"));
             }
             SlashCommand::History => {
-                let history = self.input.lines().first().map(|_| "see input history").unwrap_or("");
-                let _ = history;
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!(
-                        "Input history ({} entries): use ↑/↓ to recall",
-                        self.input_history_len()
-                    ),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system(format!(
+                    "Input history (use ↑/↓ to recall previous inputs)"
+                ));
             }
             SlashCommand::Quit | SlashCommand::Exit => {
-                std::process::exit(0);
+                self.should_quit = true;
             }
             SlashCommand::Save(path) => {
                 let body = self
                     .state
-                    .messages
+                    .blocks
                     .iter()
-                    .map(|m| format!("[{:?}]\n{}\n", m.role, m.content))
+                    .map(|b| match &b.kind {
+                        BlockKind::User => format!("[USER]\n{}\n", b.content),
+                        BlockKind::Assistant | BlockKind::StreamingAssistant => {
+                            format!("[ASSISTANT]\n{}\n", b.content)
+                        }
+                        BlockKind::ToolCall { name, args, status } => {
+                            format!("[TOOL {name} {:?}]\nargs: {args}\n{}\n", status, b.content)
+                        }
+                        BlockKind::Thinking => format!("[THINKING]\n{}\n", b.content),
+                        BlockKind::System => format!("[SYSTEM]\n{}\n", b.content),
+                        BlockKind::Error => format!("[ERROR]\n{}\n", b.content),
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 match std::fs::write(&path, body) {
-                    Ok(_) => self.state.messages.push(Message {
-                        role: MessageRole::System,
-                        content: format!("Saved → {path}"),
-                        timestamp: std::time::Instant::now(),
-                        streaming: false,
-                    }),
-                    Err(e) => self.state.messages.push(Message {
-                        role: MessageRole::Error,
-                        content: format!("Save failed: {e}"),
-                        timestamp: std::time::Instant::now(),
-                        streaming: false,
-                    }),
+                    Ok(_) => self.push_system(format!("Saved → {path}")),
+                    Err(e) => self.push_error(format!("Save failed: {e}")),
                 }
             }
             SlashCommand::Load(_path) => {
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: "Load not yet implemented".to_string(),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system("Load not yet implemented".to_string());
             }
             SlashCommand::Verify => {
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: "Verifying last code block…".to_string(),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system("Verifying last code block…".to_string());
             }
             SlashCommand::Diff => {
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: "Diff not yet implemented".to_string(),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system("Diff not yet implemented".to_string());
             }
         }
     }
 
-    fn input_history_len(&self) -> usize {
-        0
+    fn push_user(&mut self, text: String) {
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::User,
+            content: text,
+            created_at: Instant::now(),
+            elapsed_ms: None,
+        });
+    }
+
+    fn push_assistant(&mut self, text: String) {
+        let elapsed = self
+            .state
+            .run_started_at
+            .map(|s| s.elapsed().as_millis());
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::Assistant,
+            content: text,
+            created_at: Instant::now(),
+            elapsed_ms: elapsed,
+        });
+        self.state.run_started_at = None;
+    }
+
+    fn push_streaming(&mut self) {
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::StreamingAssistant,
+            content: String::new(),
+            created_at: Instant::now(),
+            elapsed_ms: Some(0),
+        });
+    }
+
+    fn push_thinking(&mut self, text: String) {
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::Thinking,
+            content: text,
+            created_at: Instant::now(),
+            elapsed_ms: None,
+        });
+    }
+
+    fn push_tool_call(&mut self, name: String, args: String) {
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::ToolCall {
+                name,
+                args,
+                status: ToolCallStatus::Running,
+            },
+            content: String::new(),
+            created_at: Instant::now(),
+            elapsed_ms: Some(0),
+        });
+    }
+
+    fn push_system(&mut self, text: String) {
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::System,
+            content: text,
+            created_at: Instant::now(),
+            elapsed_ms: None,
+        });
+    }
+
+    fn push_error(&mut self, text: String) {
+        self.state.blocks.push(ConvBlock {
+            kind: BlockKind::Error,
+            content: text,
+            created_at: Instant::now(),
+            elapsed_ms: None,
+        });
     }
 
     fn send_message(&mut self, text: String) {
-        self.state.messages.push(Message {
-            role: MessageRole::User,
-            content: text.clone(),
-            timestamp: std::time::Instant::now(),
-            streaming: false,
-        });
+        self.push_user(text.clone());
         self.conversation.push(LlmMessage::user(&text));
 
         let tx = self.ui_tx.clone();
@@ -405,10 +437,12 @@ impl App {
         let max_tokens = self.max_tokens;
         let temperature = self.temperature;
         let max_rounds = self.state.max_rounds;
-        let tool_count = self.tools.len();
+
+        self.state.run_started_at = Some(Instant::now());
+        self.push_streaming();
 
         tokio::spawn(async move {
-            let _ = tool_count;
+            let _ = max_rounds;
             tx.send(UiEvent::StatusChanged("thinking".to_string())).ok();
 
             let mut agent = Agent::new(
@@ -423,92 +457,105 @@ impl App {
 
             match agent.run(&text).await {
                 Ok(response) => {
-                    tx.send(UiEvent::AppendMessage {
-                        role: MessageRole::Assistant,
-                        content: response,
-                    })
-                    .ok();
+                    tx.send(UiEvent::StreamDone(response)).ok();
                 }
                 Err(e) => {
-                    tx.send(UiEvent::AppendMessage {
-                        role: MessageRole::Error,
-                        content: format!("Error: {e}"),
-                    })
-                    .ok();
+                    tx.send(UiEvent::AppendError(format!("Error: {e}"))).ok();
                 }
             }
             tx.send(UiEvent::StatusChanged("idle".to_string())).ok();
         });
 
-        self.state.status = AgentStatus::Thinking;
+        self.state.status = AgentStatusUsed::Thinking;
     }
 
     fn apply_ui_event(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::AppendMessage { role, content } => {
-                self.state.messages.push(Message {
-                    role,
-                    content,
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
-            }
             UiEvent::StatusChanged(s) => {
                 self.state.status = match s.as_str() {
-                    "thinking" => AgentStatus::Thinking,
-                    "streaming" => AgentStatus::Streaming,
-                    "running" => AgentStatus::Running,
-                    _ => AgentStatus::Idle,
+                    "thinking" => AgentStatusUsed::Thinking,
+                    "streaming" => AgentStatusUsed::Streaming,
+                    "running" => AgentStatusUsed::Running,
+                    _ => AgentStatusUsed::Idle,
                 };
             }
-            UiEvent::ClearConversation => {
-                self.state.messages.clear();
-                self.state.tool_events.clear();
+            UiEvent::AppendMessage { role: _, content } => {
+                self.push_assistant(content);
+            }
+            UiEvent::AppendError(content) => {
+                self.push_error(content);
+            }
+            UiEvent::StreamDone(content) => {
+                // Replace the streaming block with a final assistant block
+                if let Some(blk) = self.state.blocks.last_mut() {
+                    if matches!(blk.kind, BlockKind::StreamingAssistant) {
+                        let elapsed = self
+                            .state
+                            .run_started_at
+                            .map(|s| s.elapsed().as_millis())
+                            .unwrap_or(0);
+                        blk.kind = BlockKind::Assistant;
+                        blk.content = content;
+                        blk.elapsed_ms = Some(elapsed);
+                    } else {
+                        self.push_assistant(content);
+                    }
+                } else {
+                    self.push_assistant(content);
+                }
+                self.state.run_started_at = None;
+            }
+            UiEvent::StreamToken(token) => {
+                if let Some(blk) = self.state.last_streaming_mut() {
+                    blk.content.push_str(&token);
+                }
+            }
+            UiEvent::ThinkingStarted(text) => {
+                self.push_thinking(text);
+            }
+            UiEvent::ToolCallStarted { name, args } => {
+                self.push_tool_call(name, args);
+            }
+            UiEvent::ToolCallFinished { name, ok, output } => {
+                if let Some(blk) = self.state.blocks.iter_mut().rev().find(|b| {
+                    matches!(&b.kind, BlockKind::ToolCall { name: n, status: ToolCallStatus::Running, .. } if n == &name)
+                }) {
+                    if let BlockKind::ToolCall { status, .. } = &mut blk.kind {
+                        *status = if ok { ToolCallStatus::Ok } else { ToolCallStatus::Failed };
+                    }
+                    blk.content = output;
+                    blk.elapsed_ms = self
+                        .state
+                        .run_started_at
+                        .map(|s| s.elapsed().as_millis());
+                }
             }
             UiEvent::SwitchTheme => {
                 self.theme_name = self.theme_name.next();
                 self.theme = Theme::by_name(self.theme_name);
             }
-            UiEvent::ToolCallStarted(name) => {
-                self.state.tool_events.push(crate::tui::state::ToolEvent {
-                    name,
-                    status: crate::tui::state::ToolStatus::Running,
-                    arguments: String::new(),
-                    result: None,
-                    started_at: std::time::Instant::now(),
-                });
-            }
-            UiEvent::ToolCallFinished { name, ok, output } => {
-                if let Some(event) = self.state.tool_events.iter_mut().find(|e| e.name == name) {
-                    event.status = if ok {
-                        crate::tui::state::ToolStatus::Ok
-                    } else {
-                        crate::tui::state::ToolStatus::Failed
-                    };
-                    event.result = Some(output);
-                }
+            UiEvent::ClearConversation => {
+                self.state.blocks.clear();
             }
             UiEvent::VerificationDone(_v) => {
-                self.state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: "Verification complete".to_string(),
-                    timestamp: std::time::Instant::now(),
-                    streaming: false,
-                });
+                self.push_system("Verification complete".to_string());
             }
         }
     }
 }
 
+// Local alias because AgentStatus is in state.rs with #[allow(dead_code)]
+use crate::tui::state::AgentStatus as AgentStatusUsed;
+
 fn scan_workspace() -> Vec<FileEntry> {
     let mut entries = Vec::new();
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    collect(&root, 0, &mut entries, 0);
+    collect(&root, 0, &mut entries, 80);
     entries
 }
 
 fn collect(path: &std::path::Path, depth: usize, out: &mut Vec<FileEntry>, limit: usize) {
-    if out.len() > limit || depth > 4 {
+    if out.len() > limit || depth > 3 {
         return;
     }
     let read = match std::fs::read_dir(path) {
@@ -520,7 +567,7 @@ fn collect(path: &std::path::Path, depth: usize, out: &mut Vec<FileEntry>, limit
     for entry in paths {
         let p = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name == "target" || name == "node_modules" {
+        if name.starts_with('.') || name == "target" || name == "node_modules" || name == "Cargo.lock" {
             continue;
         }
         let is_dir = p.is_dir();
@@ -544,9 +591,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
 
-    let mut lines: Vec<Line> = vec![Line::from(format!(
-        " ⚡ Nexus Agent — Help "
-    ))];
+    let mut lines: Vec<Line> = Vec::new();
     for (cmd, desc) in COMMAND_HELP {
         lines.push(Line::from(format!("  {cmd:<24} {desc}")));
     }
@@ -583,6 +628,3 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
-
-#[allow(dead_code)]
-fn _force_link() {}

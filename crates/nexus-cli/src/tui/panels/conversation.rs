@@ -1,12 +1,19 @@
-//! Conversation panel: block-based rendering with auto-scroll.
+//! Conversation panel — modern block-based rendering.
 //!
-//! Each event (user message, assistant message, tool call, thinking) is
-//! rendered as an independent unit with its own background tint and a
-//! top border showing the role, time, and duration. Blocks never share
-//! a selection and never bleed into each other — the only thing that
-//! scrolls is the cumulative position of the blocks.
+//! Each block (user, assistant, tool, thinking, system, error) is rendered
+//! as its own widget in its own Rect, computed via `Layout::split()`.
+//! This means:
+//!   - No manual line tracking
+//!   - No per-line background fills
+//!   - No "shared selection" because blocks are independent Paragraphs
+//!   - Unicode rounded borders (╭─╮│╰─╯) for a modern look
+//!   - Distinct color per role with bold headers + icons
+//!
+//! Auto-scroll follows the bottom by default. The user can scroll up
+//! (PgUp/Up/wheel) to disable auto-follow; pressing End or scrolling to
+//! the bottom re-enables it. New blocks snap back to auto-follow.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -14,6 +21,9 @@ use ratatui::Frame;
 
 use crate::tui::state::{Block as ConvBlock, BlockKind, ToolCallStatus, TuiState};
 use crate::tui::theme::Theme;
+
+/// Vertical space (in lines) between consecutive blocks.
+const BLOCK_SPACING: u16 = 1;
 
 pub fn render_conversation(
     f: &mut Frame,
@@ -34,234 +44,291 @@ pub fn render_conversation(
 
     if state.blocks.is_empty() {
         let hint = Paragraph::new(Line::from(Span::styled(
-            "  Type a message below to start. Try /help for commands.",
+            "  Type a message below to start.  Try /help for commands.",
             Style::default().fg(theme.dim),
         )));
         f.render_widget(hint, inner);
         return;
     }
 
-    let width = inner.width.saturating_sub(2) as usize;
+    let content_width = inner.width.saturating_sub(2) as usize;
+    let viewport = inner.height;
 
-    // For each block compute its wrapped lines and total height
-    let mut block_heights: Vec<usize> = Vec::with_capacity(state.blocks.len());
-    for blk in &state.blocks {
-        let lines = render_block_lines(blk, theme, width);
-        let height = lines.len() + 2; // top + bottom border
-        block_heights.push(height);
-    }
+    // Heights for each block (header + wrapped content + 2 for borders)
+    let heights: Vec<u16> = state
+        .blocks
+        .iter()
+        .map(|b| block_height(b, content_width))
+        .collect();
 
-    let total: usize = block_heights.iter().sum::<usize>() + state.blocks.len().saturating_sub(1);
-    let viewport = inner.height as usize;
+    let total = heights
+        .iter()
+        .sum::<u16>()
+        .saturating_add((state.blocks.len() as u16).saturating_sub(1) * BLOCK_SPACING);
 
     let scroll = compute_scroll(total, viewport, state.scroll.auto_follow, state.scroll.manual_offset);
 
-    // Build the flat visible line list with bg colors per line
-    let mut visible_lines: Vec<Line<'static>> = Vec::new();
-    let mut consumed = 0usize;
-    for (blk, h) in state.blocks.iter().zip(block_heights.iter()) {
-        let blk_end = consumed + h;
-        if blk_end <= scroll {
-            consumed = blk_end + 1; // +1 for spacing
-            continue;
-        }
-        if consumed >= scroll + viewport {
-            break;
-        }
-        let bg = bg_for(&blk.kind, theme);
-        let header_color = header_color_for(&blk.kind, theme);
-        let (header_text, header_style) = render_header(blk, theme, header_color);
-
-        let block_lines = render_block_lines(blk, theme, width);
-
-        // Top border
-        if consumed + 1 > scroll {
-            visible_lines.push(styled_line(
-                border_line("▏", &header_text, theme),
-                bg,
-                header_style,
-            ));
-        }
-
-        // Content lines
-        for l in block_lines {
-            if consumed + 2 > scroll && consumed + 2 <= scroll + viewport {
-                visible_lines.push(with_bg(l, bg));
-            }
-        }
-
-        // Bottom border
-        if consumed + h > scroll && consumed + h <= scroll + viewport {
-            visible_lines.push(styled_line(
-                border_line("▏", "", theme),
-                bg,
-                Style::default().fg(theme.border),
-            ));
-        }
-
-        consumed = blk_end + 1; // +1 for spacing
+    // Compute cumulative Y positions for each block, then determine which
+    // fall inside [scroll, scroll+viewport).
+    let mut positions: Vec<u16> = Vec::with_capacity(state.blocks.len());
+    let mut y = 0u16;
+    for &h in &heights {
+        positions.push(y);
+        y = y.saturating_add(h).saturating_add(BLOCK_SPACING);
     }
 
-    f.render_widget(Clear, inner);
+    // Build the visible rects via Layout::split(). We pass the heights
+    // of all blocks intersected with the viewport.
+    let mut visible_indices: Vec<usize> = Vec::new();
+    let mut visible_constraints: Vec<Constraint> = Vec::new();
+    for (i, &h) in heights.iter().enumerate() {
+        let blk_top = positions[i];
+        let blk_bot = blk_top.saturating_add(h);
+        if blk_bot <= scroll {
+            continue;
+        }
+        if blk_top >= scroll.saturating_add(viewport) {
+            break;
+        }
+        visible_indices.push(i);
+        visible_constraints.push(Constraint::Length(h));
+    }
 
-    let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+    if visible_indices.is_empty() {
+        return;
+    }
+
+    // Add spacers between visible blocks
+    let mut full_constraints: Vec<Constraint> = Vec::new();
+    for (i, c) in visible_constraints.iter().enumerate() {
+        full_constraints.push(*c);
+        if i + 1 < visible_indices.len() {
+            full_constraints.push(Constraint::Length(BLOCK_SPACING));
+        }
+    }
+
+    let rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(full_constraints)
+        .split(inner);
+
+    // Render each block in its Rect
+    for (slot_idx, &blk_idx) in visible_indices.iter().enumerate() {
+        let rect_idx = slot_idx * 2; // each block followed by a spacer
+        if rect_idx >= rects.len() {
+            break;
+        }
+        let rect = rects[rect_idx];
+        let blk = &state.blocks[blk_idx];
+        let visible_top = scroll.saturating_sub(positions[blk_idx]);
+        render_block(f, rect, blk, theme, visible_top, content_width);
+    }
+}
+
+fn render_block(
+    f: &mut Frame,
+    rect: Rect,
+    blk: &ConvBlock,
+    theme: &Theme,
+    visible_top: u16,
+    content_width: usize,
+) {
+    let (border_color, bg, header_color, icon) = block_style(&blk.kind, theme);
+
+    // Build the rounded border block
+    let block_widget = Block::default()
+        .borders(Borders::ALL)
+        .border_set(ratatui::symbols::border::ROUNDED)
+        .border_style(Style::default().fg(border_color).bg(bg))
+        .style(Style::default().bg(bg));
+
+    let inner = block_widget.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block_widget, rect);
+
+    // Header line + content lines
+    let header = render_header_line(blk, theme, header_color, icon);
+    let content_lines = render_block_content(blk, content_width);
+
+    let mut all_lines: Vec<Line<'static>> = Vec::with_capacity(1 + content_lines.len());
+    all_lines.push(header);
+    all_lines.extend(content_lines);
+
+    let skip = visible_top as usize;
+    let take = inner.height as usize;
+    let visible: Vec<Line<'static>> = all_lines.into_iter().skip(skip).take(take).collect();
+
+    let paragraph = Paragraph::new(visible)
+        .style(Style::default().bg(bg))
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
 }
 
-fn compute_scroll(total: usize, viewport: usize, auto_follow: bool, manual: usize) -> usize {
-    if total <= viewport {
-        return 0;
-    }
-    if auto_follow {
-        return total - viewport;
-    }
-    manual.min(total.saturating_sub(viewport))
-}
-
-fn bg_for(kind: &BlockKind, theme: &Theme) -> ratatui::style::Color {
+fn block_style(
+    kind: &BlockKind,
+    theme: &Theme,
+) -> (
+    ratatui::style::Color, // border
+    ratatui::style::Color, // bg
+    ratatui::style::Color, // header
+    &'static str,          // icon
+) {
     match kind {
-        BlockKind::User => theme.block_bg_user,
-        BlockKind::Assistant | BlockKind::StreamingAssistant => theme.block_bg_assistant,
-        BlockKind::ToolCall { .. } => theme.block_bg_tool,
-        BlockKind::Thinking => theme.block_bg_thinking,
-        BlockKind::System => theme.block_bg_system,
-        BlockKind::Error => theme.error,
+        BlockKind::User => (theme.user, theme.block_bg_user, theme.user, "▸"),
+        BlockKind::Assistant | BlockKind::StreamingAssistant => (
+            theme.assistant,
+            theme.block_bg_assistant,
+            theme.assistant,
+            "⚡",
+        ),
+        BlockKind::ToolCall { status, .. } => {
+            let (header_c, icon) = match status {
+                ToolCallStatus::Running => (theme.warning, "⟳"),
+                ToolCallStatus::Ok => (theme.success, "✓"),
+                ToolCallStatus::Failed => (theme.error, "✗"),
+            };
+            (header_c, theme.block_bg_tool, header_c, icon)
+        }
+        BlockKind::Thinking => (theme.warning, theme.block_bg_thinking, theme.warning, "💭"),
+        BlockKind::System => (theme.dim, theme.block_bg_system, theme.dim, "·"),
+        BlockKind::Error => (theme.error, theme.bg, theme.error, "✗"),
     }
 }
 
-fn header_color_for(kind: &BlockKind, theme: &Theme) -> ratatui::style::Color {
-    match kind {
-        BlockKind::User => theme.user,
-        BlockKind::Assistant | BlockKind::StreamingAssistant => theme.assistant,
-        BlockKind::ToolCall { status, .. } => match status {
-            ToolCallStatus::Running => theme.warning,
-            ToolCallStatus::Ok => theme.success,
-            ToolCallStatus::Failed => theme.error,
-        },
-        BlockKind::Thinking => theme.warning,
-        BlockKind::System => theme.dim,
-        BlockKind::Error => theme.error,
-    }
-}
-
-fn render_header(blk: &ConvBlock, _theme: &Theme, color: ratatui::style::Color) -> (String, Style) {
+fn render_header_line(
+    blk: &ConvBlock,
+    _theme: &Theme,
+    color: ratatui::style::Color,
+    icon: &str,
+) -> Line<'static> {
     let elapsed = blk
         .elapsed_ms
         .map(format_elapsed_short)
         .unwrap_or_default();
-    let header = match &blk.kind {
-        BlockKind::User => format!("▸ You  {}  {elapsed}", format_time_ago(blk)),
-        BlockKind::Assistant => {
-            if elapsed.is_empty() {
-                format!("⚡ Assistant  {}", format_time_ago(blk))
-            } else {
-                format!("⚡ Assistant  {}  {elapsed}", format_time_ago(blk))
-            }
-        }
-        BlockKind::StreamingAssistant => format!(
-            "⚡ Assistant  {}  {elapsed}…",
-            format_time_ago(blk)
-        ),
-        BlockKind::Thinking => format!(
-            "⟳ Thinking  {}  {elapsed}…",
-            format_time_ago(blk)
-        ),
-        BlockKind::ToolCall { name, status, .. } => {
-            let marker = match status {
-                ToolCallStatus::Running => "⟳",
-                ToolCallStatus::Ok => "✓",
-                ToolCallStatus::Failed => "✗",
-            };
-            format!("{marker} {name}  {}  {elapsed}", format_time_ago(blk))
-        }
-        BlockKind::System => format!("* System  {}", format_time_ago(blk)),
-        BlockKind::Error => format!("✗ Error  {}", format_time_ago(blk)),
+    let time = format_time_short(blk);
+
+    let (title, right_suffix) = match &blk.kind {
+        BlockKind::User => ("You".to_string(), elapsed),
+        BlockKind::Assistant => ("Assistant".to_string(), elapsed),
+        BlockKind::StreamingAssistant => ("Assistant".to_string(), format!("{elapsed}…")),
+        BlockKind::Thinking => ("Thinking".to_string(), format!("{elapsed}…")),
+        BlockKind::ToolCall { name, .. } => (name.clone(), elapsed),
+        BlockKind::System => ("system".to_string(), String::new()),
+        BlockKind::Error => ("Error".to_string(), String::new()),
     };
-    (header, Style::default().fg(color).add_modifier(Modifier::BOLD))
+
+    let mut spans = vec![
+        Span::styled(
+            format!(" {icon} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !right_suffix.is_empty() || !time.is_empty() {
+        spans.push(Span::styled(
+            "  ",
+            Style::default().fg(ratatui::style::Color::DarkGray),
+        ));
+        if !right_suffix.is_empty() {
+            spans.push(Span::styled(
+                right_suffix,
+                Style::default().fg(ratatui::style::Color::Yellow),
+            ));
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(ratatui::style::Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            time,
+            Style::default().fg(ratatui::style::Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
-fn border_line(left: &str, right: &str, _theme: &Theme) -> String {
-    let _ = right;
-    format!("{left} {}", "")
-}
-
-fn render_block_lines(blk: &ConvBlock, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+fn render_block_content(blk: &ConvBlock, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match &blk.kind {
-        BlockKind::User => {
+        BlockKind::User | BlockKind::Assistant | BlockKind::StreamingAssistant => {
             for l in blk.content.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(theme.fg),
-                )));
+                lines.push(Line::from(Span::raw(format!(" {l}"))));
             }
             if blk.content.is_empty() {
-                lines.push(Line::from(Span::styled("  ", Style::default())));
-            }
-        }
-        BlockKind::Assistant | BlockKind::StreamingAssistant => {
-            for l in blk.content.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(theme.fg),
+                    " ",
+                    Style::default().fg(ratatui::style::Color::DarkGray),
                 )));
-            }
-            if blk.content.is_empty() {
-                lines.push(Line::from(Span::styled("  ", Style::default())));
             }
             if matches!(blk.kind, BlockKind::StreamingAssistant) {
                 lines.push(Line::from(Span::styled(
-                    "  ▌",
-                    Style::default().fg(theme.accent),
+                    " ▌",
+                    Style::default()
+                        .fg(ratatui::style::Color::Cyan)
+                        .add_modifier(Modifier::SLOW_BLINK),
                 )));
             }
         }
         BlockKind::Thinking => {
             for l in blk.content.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(theme.dim),
+                    format!(" {l}"),
+                    Style::default().fg(ratatui::style::Color::Gray),
+                )));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  reasoning…",
+                    Style::default().fg(ratatui::style::Color::DarkGray),
                 )));
             }
         }
         BlockKind::ToolCall { args, .. } => {
             if !args.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    format!("  → {}", truncate(args, 80)),
-                    Style::default().fg(theme.dim),
+                    format!(" → {}", truncate(args, 80)),
+                    Style::default().fg(ratatui::style::Color::Gray),
                 )));
             }
             if !blk.content.is_empty() {
-                for l in blk.content.lines().take(6) {
+                for l in blk.content.lines().take(10) {
                     lines.push(Line::from(Span::styled(
-                        format!("  │ {l}"),
-                        Style::default().fg(theme.dim),
+                        format!(" │ {l}"),
+                        Style::default().fg(ratatui::style::Color::Gray),
                     )));
                 }
             }
             if lines.is_empty() {
-                lines.push(Line::from(Span::styled("  ", Style::default())));
+                lines.push(Line::from(Span::styled(
+                    "  running…",
+                    Style::default().fg(ratatui::style::Color::DarkGray),
+                )));
             }
         }
         BlockKind::System => {
             for l in blk.content.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(theme.dim),
+                    format!(" {l}"),
+                    Style::default().fg(ratatui::style::Color::Gray),
                 )));
             }
         }
         BlockKind::Error => {
             for l in blk.content.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(theme.error),
+                    format!(" {l}"),
+                    Style::default().fg(ratatui::style::Color::Red),
                 )));
             }
         }
     }
+    wrap_lines(lines, width)
+}
 
-    // Hard wrap if needed
+fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     if width < 4 {
         return lines;
     }
@@ -272,30 +339,14 @@ fn render_block_lines(blk: &ConvBlock, theme: &Theme, width: usize) -> Vec<Line<
             out.push(line);
             continue;
         }
-        // Simple character-based wrap: rebuild spans with owned Strings
-        // when adjacent characters share the same style. We rebuild the
-        // line as: a fresh buffer of (text, style) pairs flushed whenever
-        // style changes or we hit the wrap boundary.
         let mut buf: Vec<(String, Style)> = Vec::new();
         let mut buf_w = 0usize;
-
-        fn flush(buf: &mut Vec<(String, Style)>, out: &mut Vec<Line<'static>>) {
-            if buf.is_empty() {
-                return;
-            }
-            let spans: Vec<Span<'static>> = buf
-                .drain(..)
-                .map(|(s, st)| Span::styled(s, st))
-                .collect();
-            out.push(Line::from(spans));
-        }
-
         for span in line.spans.into_iter() {
             let style = span.style;
             let content: String = span.content.into_owned();
             for c in content.chars() {
                 if buf_w >= width {
-                    flush(&mut buf, &mut out);
+                    flush_wrap(&mut buf, &mut out);
                     buf_w = 0;
                 }
                 if let Some((text, st)) = buf.last_mut() {
@@ -310,37 +361,47 @@ fn render_block_lines(blk: &ConvBlock, theme: &Theme, width: usize) -> Vec<Line<
                 buf_w += 1;
             }
         }
-        flush(&mut buf, &mut out);
+        flush_wrap(&mut buf, &mut out);
     }
     out
 }
 
-fn with_bg(line: Line<'static>, bg: ratatui::style::Color) -> Line<'static> {
-    let mut new_spans = Vec::with_capacity(line.spans.len());
-    for span in line.spans {
-        let mut s = span.style;
-        s = s.bg(bg);
-        new_spans.push(Span { content: span.content, style: s });
+fn flush_wrap(buf: &mut Vec<(String, Style)>, out: &mut Vec<Line<'static>>) {
+    if buf.is_empty() {
+        return;
     }
-    Line::from(new_spans)
+    let spans: Vec<Span<'static>> = buf
+        .drain(..)
+        .map(|(s, st)| Span::styled(s, st))
+        .collect();
+    out.push(Line::from(spans));
 }
 
-fn styled_line(content: String, bg: ratatui::style::Color, fg_style: Style) -> Line<'static> {
-    let mut s = fg_style;
-    s = s.bg(bg);
-    Line::from(Span::styled(content, s))
+fn block_height(blk: &ConvBlock, content_width: usize) -> u16 {
+    let n = render_block_content(blk, content_width).len() as u16;
+    n.saturating_add(2) // +1 top border, +1 bottom border, content goes inside
 }
 
-fn format_time_ago(blk: &ConvBlock) -> String {
+fn compute_scroll(total: u16, viewport: u16, auto_follow: bool, manual: usize) -> u16 {
+    if total <= viewport {
+        return 0;
+    }
+    if auto_follow {
+        return total - viewport;
+    }
+    (manual as u16).min(total.saturating_sub(viewport))
+}
+
+fn format_time_short(blk: &ConvBlock) -> String {
     let secs = blk.created_at.elapsed().as_secs();
     if secs < 5 {
         "now".to_string()
     } else if secs < 60 {
-        format!("{secs}s")
+        format!("{secs}s ago")
     } else if secs < 3600 {
-        format!("{}m", secs / 60)
+        format!("{}m ago", secs / 60)
     } else {
-        format!("{}h", secs / 3600)
+        format!("{}h ago", secs / 3600)
     }
 }
 
@@ -360,7 +421,3 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{t}…")
     }
 }
-
-// Borders placeholder type so the unused `Block` import doesn't warn
-#[allow(dead_code)]
-type _B = Borders;

@@ -360,6 +360,8 @@ impl App {
             created_at: Instant::now(),
             elapsed_ms: None,
         });
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn push_assistant(&mut self, text: String) {
@@ -374,6 +376,8 @@ impl App {
             elapsed_ms: elapsed,
         });
         self.state.run_started_at = None;
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn push_streaming(&mut self) {
@@ -383,6 +387,8 @@ impl App {
             created_at: Instant::now(),
             elapsed_ms: Some(0),
         });
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn push_thinking(&mut self, text: String) {
@@ -392,6 +398,8 @@ impl App {
             created_at: Instant::now(),
             elapsed_ms: None,
         });
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn push_tool_call(&mut self, name: String, args: String) {
@@ -405,6 +413,8 @@ impl App {
             created_at: Instant::now(),
             elapsed_ms: Some(0),
         });
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn push_system(&mut self, text: String) {
@@ -414,6 +424,8 @@ impl App {
             created_at: Instant::now(),
             elapsed_ms: None,
         });
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn push_error(&mut self, text: String) {
@@ -423,6 +435,8 @@ impl App {
             created_at: Instant::now(),
             elapsed_ms: None,
         });
+        self.state.scroll.auto_follow = true;
+        self.state.scroll.manual_offset = 0;
     }
 
     fn send_message(&mut self, text: String) {

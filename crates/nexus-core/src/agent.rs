@@ -252,7 +252,13 @@ impl Agent {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        let _prediction = self.predictor.predict(user_input, &available_tools);
+        let prediction = self.predictor.predict(user_input, &available_tools);
+
+        on_event(AgentEvent::Predicted {
+            confidence: prediction.confidence,
+            approach: prediction.predicted_approach.clone(),
+            risks: prediction.risk_factors.clone(),
+        });
 
         let enhanced_prompt = self.build_enhanced_prompt(user_input);
         let user_msg = Message::user(&enhanced_prompt);
@@ -414,6 +420,11 @@ impl Agent {
                 chain.add_thought(ThoughtType::Reflection, &content, 0.95);
 
                 let verification = self.verify_response(&content, user_input);
+                on_event(AgentEvent::Verified {
+                    score: verification.score,
+                    passed: verification.passed,
+                    issues: verification.issues.clone(),
+                });
                 if !verification.passed {
                     chain.add_thought(
                         ThoughtType::Verification,
@@ -456,6 +467,21 @@ impl Agent {
             },
         };
         self.learner.record_interaction(interaction);
+
+        // Store important learnings in long-term memory
+        if final_quality > 0.8 {
+            let key = format!("success:{}", self.context.round);
+            self.long_term_memory.store(
+                &key,
+                user_input,
+                MemoryCategory::Learning,
+                final_quality,
+            );
+            on_event(AgentEvent::Stored {
+                key,
+                category: "Learning".to_string(),
+            });
+        }
 
         let response = _final_response.ok_or(CoreError::EmptyResponse)?;
         on_event(AgentEvent::Done(response.clone()));

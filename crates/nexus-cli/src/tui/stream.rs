@@ -39,6 +39,23 @@ pub enum UiEvent {
         ok: bool,
         output: String,
     },
+    /// Internal: predictor's analysis before the run started.
+    Predicted {
+        confidence: f32,
+        approach: String,
+        risks: Vec<String>,
+    },
+    /// Internal: verifier result on the final assistant response.
+    Verified {
+        score: f32,
+        passed: bool,
+        issues: Vec<String>,
+    },
+    /// Internal: stored a long-term memory entry.
+    Stored {
+        key: String,
+        category: String,
+    },
     /// Clear all blocks.
     ClearConversation,
     /// Switch to the next theme.

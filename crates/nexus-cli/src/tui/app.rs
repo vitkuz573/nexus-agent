@@ -494,6 +494,15 @@ impl App {
                             UiEvent::ToolCallFinished { name, ok, output }
                         }
                         AgentEvent::Thinking(t) => UiEvent::ThinkingStarted(t),
+                        AgentEvent::Predicted { confidence, approach, risks } => {
+                            UiEvent::Predicted { confidence, approach, risks }
+                        }
+                        AgentEvent::Verified { score, passed, issues } => {
+                            UiEvent::Verified { score, passed, issues }
+                        }
+                        AgentEvent::Stored { key, category } => {
+                            UiEvent::Stored { key, category }
+                        }
                         AgentEvent::Done(d) => UiEvent::StreamDone(d),
                         AgentEvent::Failed(e) => UiEvent::AppendError(e),
                     };
@@ -570,6 +579,31 @@ impl App {
                         .run_started_at
                         .map(|s| s.elapsed().as_millis());
                 }
+            }
+            UiEvent::Predicted { confidence, approach, risks } => {
+                let pct = (confidence * 100.0) as u32;
+                let mut body = format!(
+                    "📊 predictor → confidence {pct}%\n   approach: {approach}"
+                );
+                if !risks.is_empty() {
+                    body.push_str(&format!("\n   risks: {}", risks.join(", ")));
+                }
+                self.push_system(body);
+            }
+            UiEvent::Verified { score, passed, issues } => {
+                let pct = (score * 100.0) as u32;
+                let mark = if passed { "✓" } else { "✗" };
+                let mut body = format!(
+                    "{mark} verifier → score {pct}%{}",
+                    if passed { " (passed)" } else { " (failed)" }
+                );
+                if !issues.is_empty() {
+                    body.push_str(&format!("\n   issues: {}", issues.join("; ")));
+                }
+                self.push_system(body);
+            }
+            UiEvent::Stored { key, category } => {
+                self.push_system(format!("💾 stored → {category}: {key}"));
             }
             UiEvent::SwitchTheme => {
                 self.theme_name = self.theme_name.next();

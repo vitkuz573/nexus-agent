@@ -26,3 +26,4 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
 parking_lot = "0.12"
+pulldown-cmark = { workspace = true }

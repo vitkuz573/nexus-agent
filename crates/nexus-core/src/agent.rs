@@ -1,11 +1,12 @@
 use crate::context::AgentContext;
 use crate::error::CoreError;
+use crate::events::AgentEvent;
 use crate::memory::Memory;
 use nexus_brain::scaffold::CognitiveScaffold;
 use nexus_brain::verify::CodeVerifier;
 use nexus_brain::thought::{ThoughtChain, ThoughtType};
 use nexus_client::message::{Message, ToolCall};
-use nexus_client::provider::LlmProvider;
+use nexus_client::provider::{ChatResponse, Choice, LlmProvider, ResponseMessage};
 use nexus_intel::learner::{AdaptiveLearner, Interaction, InteractionContext, TaskComplexity};
 use nexus_intel::memory::{LongTermMemory, MemoryCategory};
 use nexus_intel::predictor::SuccessPredictor;
@@ -229,6 +230,243 @@ impl Agent {
         Ok(response)
     }
 
+    /// Run the agent loop, calling `on_event` for each meaningful event.
+    ///
+    /// Tokens are streamed only for the final assistant response (after
+    /// all tool-call rounds have completed). During tool-call rounds the
+    /// model returns tool_calls only, so no tokens are emitted.
+    pub async fn run_streaming<F>(
+        &mut self,
+        user_input: &str,
+        mut on_event: F,
+    ) -> Result<String, CoreError>
+    where
+        F: FnMut(AgentEvent),
+    {
+        let mut chain = ThoughtChain::new();
+        chain.add_thought(ThoughtType::Problem, user_input, 1.0);
+
+        let available_tools: Vec<String> = self
+            .registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        let _prediction = self.predictor.predict(user_input, &available_tools);
+
+        let enhanced_prompt = self.build_enhanced_prompt(user_input);
+        let user_msg = Message::user(&enhanced_prompt);
+        self.memory.add(user_msg.clone());
+        self.context.push_message(user_msg);
+
+        let tool_schemas: Vec<nexus_client::provider::ToolSchema> = self
+            .registry
+            .definitions()
+            .iter()
+            .map(|def| nexus_client::provider::ToolSchema {
+                schema_type: "function".to_string(),
+                function: nexus_client::provider::FunctionSchema {
+                    name: def.name.clone(),
+                    description: def.description.clone(),
+                    parameters: def.to_json_schema(),
+                },
+            })
+            .collect();
+
+        let mut _final_response: Option<String> = None;
+        let mut run_success = false;
+        let mut final_quality = 0.0;
+
+        loop {
+            self.context.increment_round();
+            if !self.context.can_continue() {
+                warn!(round = self.context.round, "max rounds reached");
+                break;
+            }
+
+            let messages = self.context.messages_with_system(&self.system_prompt);
+
+            // Try streaming first. If the provider doesn't return tokens
+            // (or errors), we fall back to non-streaming.
+            let response = match self
+                .provider
+                .complete_stream(
+                    &self.model,
+                    &messages,
+                    Some(&tool_schemas),
+                    self.max_tokens,
+                    self.temperature,
+                )
+                .await
+            {
+                Ok(stream) => {
+                    use futures::StreamExt;
+                    // Consume the stream, collecting tokens into a message
+                    // and detecting tool calls.
+                    let mut content = String::new();
+                    let mut tool_calls_map: std::collections::HashMap<
+                        usize,
+                        (String, String, String),
+                    > = std::collections::HashMap::new();
+                    let mut finish_reason: Option<String> = None;
+                    futures::pin_mut!(stream);
+                    while let Some(ev) = stream.next().await {
+                        match ev {
+                            Ok(nexus_client::stream::StreamEvent::Content(token)) => {
+                                content.push_str(&token);
+                                on_event(AgentEvent::Token(token));
+                            }
+                            Ok(nexus_client::stream::StreamEvent::ToolCallStart { index, id, name }) => {
+                                tool_calls_map.insert(index, (id, name, String::new()));
+                            }
+                            Ok(nexus_client::stream::StreamEvent::ToolCallArguments { index, arguments }) => {
+                                if let Some(entry) = tool_calls_map.get_mut(&index) {
+                                    entry.2.push_str(&arguments);
+                                }
+                            }
+                            Ok(nexus_client::stream::StreamEvent::Done { finish_reason: r }) => {
+                                finish_reason = r.or(finish_reason);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "stream error");
+                            }
+                        }
+                    }
+
+                    // Reconstruct a ChatResponse from the streamed events.
+                    let tool_calls: Vec<ToolCall> = tool_calls_map
+                        .into_iter()
+                        .map(|(_, (id, name, args))| ToolCall {
+                            id,
+                            call_type: "function".to_string(),
+                            function: nexus_client::message::FunctionCall {
+                                name,
+                                arguments: args,
+                            },
+                        })
+                        .collect();
+
+                    let response_msg = ResponseMessage {
+                        role: Some("assistant".to_string()),
+                        content: if content.is_empty() { None } else { Some(content) },
+                        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    };
+                    let choice = Choice {
+                        message: response_msg,
+                        finish_reason: finish_reason.clone(),
+                    };
+                    ChatResponse {
+                        id: format!("stream-{}", self.context.round),
+                        choices: vec![choice],
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "stream failed, falling back to non-stream");
+                    self.provider
+                        .complete(
+                            &self.model,
+                            &messages,
+                            Some(&tool_schemas),
+                            self.max_tokens,
+                            self.temperature,
+                        )
+                        .await?
+                }
+            };
+
+            let choice = response.choices.first().ok_or(CoreError::EmptyResponse)?;
+            let resp_msg = &choice.message;
+
+            if let Some(tool_calls) = &resp_msg.tool_calls {
+                let assistant_content = resp_msg.content.clone().unwrap_or_default();
+                if !assistant_content.is_empty() {
+                    chain.add_thought(ThoughtType::Analysis, &assistant_content, 0.9);
+                }
+                self.context.push_message(Message {
+                    role: nexus_client::message::Role::Assistant,
+                    content: assistant_content,
+                    tool_calls: Some(tool_calls.clone()),
+                    tool_call_id: None,
+                });
+
+                for tc in tool_calls {
+                    let tool_name = tc.function.name.clone();
+                    let tool_args = tc.function.arguments.clone();
+                    self.tools_used_in_run.push(tool_name.clone());
+                    on_event(AgentEvent::ToolStarted {
+                        name: tool_name.clone(),
+                        args: tool_args.clone(),
+                    });
+
+                    let exec_result = self.execute_tool_call(tc).await;
+                    let (ok, output) = match exec_result {
+                        Ok(out) => (true, out),
+                        Err(e) => (false, format!("Error: {e}")),
+                    };
+                    on_event(AgentEvent::ToolFinished {
+                        name: tool_name,
+                        ok,
+                        output,
+                    });
+                }
+            } else {
+                let content = resp_msg.content.clone().unwrap_or_default();
+                chain.add_thought(ThoughtType::Reflection, &content, 0.95);
+
+                let verification = self.verify_response(&content, user_input);
+                if !verification.passed {
+                    chain.add_thought(
+                        ThoughtType::Verification,
+                        &format!("Issues: {:?}", verification.issues),
+                        0.5,
+                    );
+                    final_quality = verification.score;
+                } else {
+                    final_quality = if verification.score > 0.0 { verification.score } else { 0.85 };
+                }
+
+                run_success = verification.passed || verification.score >= 0.5;
+                _final_response = Some(content);
+                break;
+            }
+        }
+
+        self.thought_chains.push(chain);
+
+        let interaction = Interaction {
+            id: format!("{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()),
+            task: user_input.to_string(),
+            approach: "agent-loop-streaming".to_string(),
+            tools_used: self.tools_used_in_run.drain(..).collect(),
+            rounds: self.context.round,
+            success: run_success,
+            quality_score: final_quality,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            context: InteractionContext {
+                language: Some("rust".to_string()),
+                framework: None,
+                complexity: TaskComplexity::Moderate,
+                similar_past_tasks: Vec::new(),
+            },
+        };
+        self.learner.record_interaction(interaction);
+
+        let response = _final_response.ok_or(CoreError::EmptyResponse)?;
+        on_event(AgentEvent::Done(response.clone()));
+
+        let final_msg = Message::assistant(&response);
+        self.memory.add(final_msg.clone());
+        self.context.push_message(final_msg);
+
+        Ok(response)
+    }
+
     fn build_enhanced_prompt(&self, task: &str) -> String {
         let _scaffold_prompt = self.scaffold.create_prompt(task, "");
 
@@ -308,7 +546,7 @@ Before writing ANY code, you MUST:
         blocks
     }
 
-    async fn execute_tool_call(&mut self, tc: &ToolCall) -> Result<(), CoreError> {
+    async fn execute_tool_call(&mut self, tc: &ToolCall) -> Result<String, CoreError> {
         let args: serde_json::Value =
             serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
 
@@ -325,7 +563,7 @@ Before writing ANY code, you MUST:
         self.memory.add(tool_msg.clone());
         self.context.push_message(tool_msg);
 
-        Ok(())
+        Ok(result)
     }
 
     pub fn clear_context(&mut self) {

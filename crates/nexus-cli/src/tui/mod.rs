@@ -7,6 +7,7 @@
 pub mod app;
 pub mod command;
 pub mod input;
+pub mod markdown;
 pub mod panels;
 pub mod state;
 pub mod stream;

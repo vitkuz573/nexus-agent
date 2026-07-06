@@ -10,7 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventK
 use nexus_client::message::Message as LlmMessage;
 use nexus_client::provider::{LlmProvider, ToolSchema};
 use nexus_config::provider::ProviderConfig;
-use nexus_core::Agent;
+use nexus_core::{Agent, AgentEvent};
 use nexus_tools::registry::ToolRegistry;
 use ratatui::prelude::*;
 use tokio::sync::mpsc;
@@ -167,6 +167,19 @@ impl App {
                 self.input.clear();
                 return;
             }
+        }
+
+        // PgUp / PgDown always scroll the conversation, regardless of focus
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_up(5);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.scroll_down(5);
+                return;
+            }
+            _ => {}
         }
 
         match self.state.focus {
@@ -469,13 +482,27 @@ impl App {
                 temperature,
             );
 
-            match agent.run(&text).await {
-                Ok(response) => {
-                    tx.send(UiEvent::StreamDone(response)).ok();
-                }
-                Err(e) => {
-                    tx.send(UiEvent::AppendError(format!("Error: {e}"))).ok();
-                }
+            let ui_tx = tx.clone();
+            let result = agent
+                .run_streaming(&text, move |event| {
+                    let ev = match event {
+                        AgentEvent::Token(t) => UiEvent::StreamToken(t),
+                        AgentEvent::ToolStarted { name, args } => {
+                            UiEvent::ToolCallStarted { name, args }
+                        }
+                        AgentEvent::ToolFinished { name, ok, output } => {
+                            UiEvent::ToolCallFinished { name, ok, output }
+                        }
+                        AgentEvent::Thinking(t) => UiEvent::ThinkingStarted(t),
+                        AgentEvent::Done(d) => UiEvent::StreamDone(d),
+                        AgentEvent::Failed(e) => UiEvent::AppendError(e),
+                    };
+                    ui_tx.send(ev).ok();
+                })
+                .await;
+
+            if let Err(e) = result {
+                tx.send(UiEvent::AppendError(format!("Error: {e}"))).ok();
             }
             tx.send(UiEvent::StatusChanged("idle".to_string())).ok();
         });

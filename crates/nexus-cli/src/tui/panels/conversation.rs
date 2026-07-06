@@ -21,6 +21,7 @@ use ratatui::Frame;
 
 use crate::tui::state::{Block as ConvBlock, BlockKind, ToolCallStatus, TuiState};
 use crate::tui::theme::Theme;
+use crate::tui::markdown::render_markdown;
 
 /// Vertical space (in lines) between consecutive blocks.
 const BLOCK_SPACING: u16 = 1;
@@ -253,15 +254,31 @@ fn render_header_line(
 fn render_block_content(blk: &ConvBlock, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match &blk.kind {
-        BlockKind::User | BlockKind::Assistant | BlockKind::StreamingAssistant => {
+        BlockKind::User => {
             for l in blk.content.lines() {
                 lines.push(Line::from(Span::raw(format!(" {l}"))));
             }
+            if blk.content.is_empty() {
+                lines.push(Line::from(" "));
+            }
+        }
+        BlockKind::Assistant | BlockKind::StreamingAssistant => {
+            // Render assistant content as Markdown so **bold**, `code`,
+            // lists, headers, etc. are styled instead of shown raw.
             if blk.content.is_empty() {
                 lines.push(Line::from(Span::styled(
                     " ",
                     Style::default().fg(ratatui::style::Color::DarkGray),
                 )));
+            } else {
+                // Use a temporary theme instance for markdown rendering
+                // (render_markdown only needs colors; the real theme is
+                // applied per-block via the Paragraph style anyway).
+                let tmp_theme = Theme::dark();
+                let md_lines = render_markdown(&blk.content, &tmp_theme);
+                for l in md_lines {
+                    lines.push(l);
+                }
             }
             if matches!(blk.kind, BlockKind::StreamingAssistant) {
                 lines.push(Line::from(Span::styled(
